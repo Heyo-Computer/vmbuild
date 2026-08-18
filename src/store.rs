@@ -191,6 +191,21 @@ impl Store {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
+
+        // Already installed? Then there is nothing to do -- and doing it
+        // anyway is actively harmful. `rename` between two links to the *same*
+        // inode is defined by POSIX to "return successfully and perform no
+        // other action", so the staging link would survive the rename, leaving
+        // a stray `.part` that inflates the blob's link count. GC treats
+        // `nlink > 1` as "still referenced", so that orphan would pin the blob
+        // forever.
+        if let (Ok(d), Ok(b)) = (fs::metadata(dest), fs::metadata(&blob))
+            && d.ino() == b.ino()
+            && d.dev() == b.dev()
+        {
+            return Ok(InstallKind::Link);
+        }
+
         let part = dest.with_extension("ext4.part");
         let _ = fs::remove_file(&part);
 
@@ -211,6 +226,9 @@ impl Store {
             Err(e) => return Err(Error::Io(e)),
         };
         fs::rename(&part, dest)?;
+        // Belt to the early-return's braces: if `part` and `dest` ever end up
+        // as links to one inode, the rename above is a silent no-op.
+        let _ = fs::remove_file(&part);
         Ok(kind)
     }
 
@@ -353,13 +371,27 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent() {
+    fn install_is_idempotent_and_leaves_no_staging_file() {
         let (d, s) = store();
         put_dummy(&s, "k", b"payload");
         let dest = d.path().join("c/img.ext4");
-        s.install("k", &dest).unwrap();
-        s.install("k", &dest).unwrap();
+        for _ in 0..3 {
+            s.install("k", &dest).unwrap();
+        }
         assert_eq!(fs::read(&dest).unwrap(), b"payload");
+
+        // Re-installing content that is already there used to leave a
+        // `.part` link behind, because renaming one link of an inode onto
+        // another link of the *same* inode is a POSIX no-op.
+        assert!(
+            !dest.with_extension("ext4.part").exists(),
+            "staging file survived the install"
+        );
+        assert_eq!(
+            fs::metadata(s.blob("k")).unwrap().nlink(),
+            2,
+            "expected exactly the blob and the installed name to link the inode"
+        );
     }
 
     #[test]
