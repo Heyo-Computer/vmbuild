@@ -4,8 +4,8 @@
 // calculations, hashing, and serialization for both inline (inode) and
 // block-level xattrs.
 
-use crate::constants::*;
-use crate::error::FormatError;
+use super::constants::*;
+use super::error::FormatError;
 
 // ---------------------------------------------------------------------------
 // Prefix table

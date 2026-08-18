@@ -7,10 +7,10 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use crate::constants::*;
-use crate::error::{FormatError, FormatResult};
-use crate::formatter::{FileTimestamps, Formatter};
-use crate::types::timestamp_now;
+use super::constants::*;
+use super::error::{FormatError, FormatResult};
+use super::formatter::{FileTimestamps, Formatter};
+use super::types::timestamp_now;
 
 impl Formatter {
     /// Unpack a tar archive onto this ext4 filesystem.

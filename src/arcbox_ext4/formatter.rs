@@ -11,13 +11,13 @@ use std::path::Path;
 
 use uuid::Uuid;
 
-use crate::constants::*;
-use crate::dir;
-use crate::error::{FormatError, FormatResult};
-use crate::extent;
-use crate::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
-use crate::types::*;
-use crate::xattr::{ExtendedAttribute, XattrState};
+use super::constants::*;
+use super::dir;
+use super::error::{FormatError, FormatResult};
+use super::extent;
+use super::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
+use super::types::*;
+use super::xattr::{ExtendedAttribute, XattrState};
 
 /// Maximum bytes that fit in the ext4 superblock's `volume_name` field.
 const VOLUME_NAME_LEN: usize = 16;

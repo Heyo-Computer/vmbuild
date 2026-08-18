@@ -4,8 +4,8 @@
 // Each entry has an 8-byte header (DirectoryEntry) followed by the name bytes
 // and padding to a 4-byte boundary.
 
-use crate::constants::*;
-use crate::types::*;
+use super::constants::*;
+use super::types::*;
 use std::io::{self, Write};
 
 // ---------------------------------------------------------------------------

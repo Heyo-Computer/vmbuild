@@ -14,7 +14,7 @@ pub mod finish;
 pub mod sizing;
 
 use crate::error::{Error, Result};
-use arcbox_ext4::{FileTimestamps, FormatOptions, Formatter};
+use crate::arcbox_ext4::{FileTimestamps, FormatOptions, Formatter};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;

@@ -7,12 +7,12 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::constants::*;
-use crate::error::{ReadError, ReadResult};
-use crate::extent;
-use crate::file_tree::InodeNumber;
-use crate::reader::Reader;
-use crate::types::*;
+use super::constants::*;
+use super::error::{ReadError, ReadResult};
+use super::extent;
+use super::file_tree::InodeNumber;
+use super::reader::Reader;
+use super::types::*;
 
 /// Maximum number of symlink hops before we declare a loop.
 const MAX_SYMLINK_HOPS: usize = 40;

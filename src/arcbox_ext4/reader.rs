@@ -9,12 +9,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::constants::*;
-use crate::dir;
-use crate::error::{ReadError, ReadResult};
-use crate::extent;
-use crate::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
-use crate::types::*;
+use super::constants::*;
+use super::dir;
+use super::error::{ReadError, ReadResult};
+use super::extent;
+use super::file_tree::{BlockRange, FileTree, FileTreeNode, InodeNumber};
+use super::types::*;
 
 /// Read-only ext4 filesystem reader.
 ///
@@ -265,7 +265,7 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Formatter;
+    use crate::arcbox_ext4::Formatter;
 
     /// Helper: create a formatter backed by a temp file, returning the reader
     /// after closing the formatter.

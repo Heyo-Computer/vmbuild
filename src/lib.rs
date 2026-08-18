@@ -9,6 +9,10 @@
 //! all, so the part where a bug is silent and catastrophic can be tested,
 //! fuzzed and differentially compared against `mke2fs -d` on its own.
 
+// Vendored fork of arcbox-ext4; see src/arcbox_ext4/PATCHES.md. Private: its
+// API is an implementation detail of `ext4`, not part of vmbuild's surface.
+mod arcbox_ext4;
+
 pub mod build;
 pub mod buildkit;
 pub mod error;

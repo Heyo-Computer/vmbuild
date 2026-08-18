@@ -6,9 +6,9 @@
 // Read path: parse an extent tree from an inode's `block` field, returning
 // physical block ranges.
 
-use crate::constants::*;
-use crate::file_tree::BlockRange;
-use crate::types::*;
+use super::constants::*;
+use super::file_tree::BlockRange;
+use super::types::*;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ pub fn parse_extents<R: Read + Seek>(
     inode: &Inode,
     block_size: u64,
     reader: &mut R,
-) -> Result<Vec<(u32, u32)>, crate::error::ReadError> {
+) -> Result<Vec<(u32, u32)>, super::error::ReadError> {
     let header = ExtentHeader::read_from(&inode.block);
 
     if header.magic != EXTENT_HEADER_MAGIC {
@@ -270,7 +270,7 @@ pub fn parse_extents<R: Read + Seek>(
     match header.depth {
         0 => parse_depth0(&inode.block, &header),
         1 => parse_depth1(&inode.block, &header, block_size, reader),
-        _ => Err(crate::error::ReadError::DeepExtentsUnsupported),
+        _ => Err(super::error::ReadError::DeepExtentsUnsupported),
     }
 }
 
@@ -278,13 +278,13 @@ pub fn parse_extents<R: Read + Seek>(
 fn parse_depth0(
     block_field: &[u8],
     header: &ExtentHeader,
-) -> Result<Vec<(u32, u32)>, crate::error::ReadError> {
+) -> Result<Vec<(u32, u32)>, super::error::ReadError> {
     let mut ranges = Vec::with_capacity(header.entries as usize);
 
     for i in 0..header.entries as usize {
         let off = ExtentHeader::SIZE + i * ExtentLeaf::SIZE;
         if off + ExtentLeaf::SIZE > block_field.len() {
-            return Err(crate::error::ReadError::InvalidExtents);
+            return Err(super::error::ReadError::InvalidExtents);
         }
         let leaf = ExtentLeaf::read_from(&block_field[off..]);
         let phys_start = leaf.start_lo;
@@ -302,13 +302,13 @@ fn parse_depth1<R: Read + Seek>(
     header: &ExtentHeader,
     block_size: u64,
     reader: &mut R,
-) -> Result<Vec<(u32, u32)>, crate::error::ReadError> {
+) -> Result<Vec<(u32, u32)>, super::error::ReadError> {
     let mut ranges = Vec::new();
 
     for i in 0..header.entries as usize {
         let off = ExtentHeader::SIZE + i * ExtentIndex::SIZE;
         if off + ExtentIndex::SIZE > block_field.len() {
-            return Err(crate::error::ReadError::InvalidExtents);
+            return Err(super::error::ReadError::InvalidExtents);
         }
         let index = ExtentIndex::read_from(&block_field[off..]);
 
@@ -317,21 +317,21 @@ fn parse_depth1<R: Read + Seek>(
         let byte_offset = phys_block * block_size;
 
         reader.seek(SeekFrom::Start(byte_offset))
-            .map_err(|_| crate::error::ReadError::CouldNotReadBlock(phys_block as u32))?;
+            .map_err(|_| super::error::ReadError::CouldNotReadBlock(phys_block as u32))?;
 
         let mut leaf_buf = vec![0u8; block_size as usize];
         reader.read_exact(&mut leaf_buf)
-            .map_err(|_| crate::error::ReadError::CouldNotReadBlock(phys_block as u32))?;
+            .map_err(|_| super::error::ReadError::CouldNotReadBlock(phys_block as u32))?;
 
         let leaf_header = ExtentHeader::read_from(&leaf_buf);
         if leaf_header.magic != EXTENT_HEADER_MAGIC || leaf_header.depth != 0 {
-            return Err(crate::error::ReadError::InvalidExtents);
+            return Err(super::error::ReadError::InvalidExtents);
         }
 
         for j in 0..leaf_header.entries as usize {
             let leaf_off = ExtentHeader::SIZE + j * ExtentLeaf::SIZE;
             if leaf_off + ExtentLeaf::SIZE > leaf_buf.len() {
-                return Err(crate::error::ReadError::InvalidExtents);
+                return Err(super::error::ReadError::InvalidExtents);
             }
             let leaf = ExtentLeaf::read_from(&leaf_buf[leaf_off..]);
             let phys_start = leaf.start_lo;

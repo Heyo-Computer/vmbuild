@@ -1,20 +1,19 @@
-# The fork is a workspace member, not just a path dependency, so `cargo test`
-# runs its inline tests too. We patched it; its tests are a regression gate.
-[workspace]
-members = ["vendor/arcbox-ext4"]
-
 [package]
 name = "vmbuild"
 version = "0.1.0"
 edition = "2024"
 description = "Fast, content-addressed VM rootfs builder for Firecracker/KVM"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
+# edition 2024
+rust-version = "1.85"
+keywords = ["ext4", "firecracker", "microvm", "rootfs", "buildkit"]
+categories = ["development-tools::build-utils", "filesystem", "virtualization"]
+# TODO(you): set before publishing -- I don't know the URL, and a wrong one is
+# worse than none. `documentation` defaults to docs.rs and needs no entry.
+# repository = "https://github.com/<org>/vmbuild"
 
 [dependencies]
-# Forked on day one -- see vendor/arcbox-ext4/PATCHES.md. Upstream is a
-# single-vendor 0.1.x that ships no tests in the published crate.
-arcbox-ext4 = { path = "vendor/arcbox-ext4" }
-
 tar = "0.4"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }

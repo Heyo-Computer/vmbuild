@@ -4,7 +4,7 @@
 // <https://ext4.wiki.kernel.org/index.php/Ext4_Disk_Layout>.
 // No `unsafe`, no zerocopy -- just plain `read_from` / `write_to`.
 
-use crate::constants::*;
+use super::constants::*;
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("ext4: {0}")]
-    Ext4(#[from] arcbox_ext4::error::FormatError),
+    Ext4(#[from] crate::arcbox_ext4::error::FormatError),
 
     #[error("tar entry {path:?} escapes the image root")]
     PathEscape { path: PathBuf },
