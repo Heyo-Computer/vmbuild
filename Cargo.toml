@@ -1,0 +1,38 @@
+# The fork is a workspace member, not just a path dependency, so `cargo test`
+# runs its inline tests too. We patched it; its tests are a regression gate.
+[workspace]
+members = ["vendor/arcbox-ext4"]
+
+[package]
+name = "vmbuild"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, content-addressed VM rootfs builder for Firecracker/KVM"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Forked on day one -- see vendor/arcbox-ext4/PATCHES.md. Upstream is a
+# single-vendor 0.1.x that ships no tests in the published crate.
+arcbox-ext4 = { path = "vendor/arcbox-ext4" }
+
+tar = "0.4"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+fs2 = "0.4"
+# heyvm's POST /images/build ships the context as gzipped tar.
+flate2 = "1"
+tempfile = "3"
+# For errno constants (EXDEV); avoids hardcoding a magic number that
+# happens to agree across Linux and macOS.
+libc = "0.2"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+tar = "0.4"
+
+[profile.release]
+debug = 1
