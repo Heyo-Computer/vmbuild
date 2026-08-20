@@ -15,14 +15,17 @@ mod arcbox_ext4;
 
 pub mod build;
 pub mod buildkit;
+pub mod doctor;
 pub mod error;
 pub mod ext4;
 pub mod key;
 pub mod store;
+#[cfg(feature = "zfs")]
+pub mod zfs;
 
 pub use build::{BuildOutcome, BuildRequest, CacheHit};
 pub use buildkit::{BuildSpec, ContextSource, DockerfileSource};
 pub use error::{Error, Result};
 pub use ext4::{Ext4Options, Ext4Stats, SizePolicy, write_ext4_from_tar};
 pub use key::RecipeKey;
-pub use store::{GcPolicy, InstallKind, Store};
+pub use store::{GcPolicy, InstallKind, Materialization, StorageBackend, Store};

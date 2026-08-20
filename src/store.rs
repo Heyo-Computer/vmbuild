@@ -21,12 +21,166 @@ use fs2::FileExt;
 use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------------
+// Sparse copy
+// ---------------------------------------------------------------------------
+
+/// Copy `src` to `dest` preserving holes, returning the bytes actually written.
+///
+/// `std::fs::copy` uses `copy_file_range`, which does **not** preserve holes:
+/// measured here, a 200 MiB-apparent / 4 MiB-actual file becomes 200 MiB
+/// actual. Rootfs images are extremely sparse -- one catalog image is 20 GiB
+/// apparent for 582 MiB of data -- so a densifying copy turns a 582 MiB image
+/// into 20 GiB of writes. (`cp` looks fine only because coreutils does this
+/// same hole walk itself.)
+///
+/// Linux only. Elsewhere this falls back to `fs::copy`; correctness is
+/// identical, only the sparseness is lost.
+#[cfg(target_os = "linux")]
+fn sparse_copy(src: &Path, dest: &Path) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::AsRawFd;
+
+    // SEEK_DATA / SEEK_HOLE. Not exposed by std::io::SeekFrom.
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+
+    let mut s = fs::File::open(src)?;
+    // OpenZFS before 2.2.2 reports stale hole information for a file with
+    // dirty data -- the December 2023 "cp corrupts files" bug. vmbuild writes
+    // a blob and copies it moments later, which is exactly that shape, so sync
+    // before trusting SEEK_DATA. Best-effort: fsync on an O_RDONLY fd is legal
+    // on Linux but not worth failing the copy over.
+    let _ = s.sync_all();
+
+    let len = s.metadata()?.len();
+    let mut d = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644) // never inherit a daemon's umask
+        .open(dest)?;
+    // Establish the full length up front so a hole at EOF survives -- a
+    // data-extent-only copy would otherwise truncate it away.
+    d.set_len(len)?;
+
+    let mut written = 0u64;
+    let mut off = 0i64;
+    let mut buf = vec![0u8; 1 << 20];
+    while (off as u64) < len {
+        // Next byte of data at or after `off`; ENXIO means only holes remain.
+        let start = unsafe { libc::lseek(s.as_raw_fd(), off, SEEK_DATA) };
+        if start < 0 {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::ENXIO) {
+                break;
+            }
+            return Err(Error::Io(e));
+        }
+        let end = unsafe { libc::lseek(s.as_raw_fd(), start, SEEK_HOLE) };
+        if end < 0 {
+            return Err(Error::Io(io::Error::last_os_error()));
+        }
+
+        s.seek(SeekFrom::Start(start as u64))?;
+        d.seek(SeekFrom::Start(start as u64))?;
+        let mut remaining = (end - start) as u64;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = s.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            d.write_all(&buf[..n])?;
+            written += n as u64;
+            remaining -= n as u64;
+        }
+        off = end;
+    }
+    d.sync_all()?;
+    Ok(written)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn sparse_copy(src: &Path, dest: &Path) -> Result<u64> {
+    Ok(fs::copy(src, dest)?)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum InstallKind {
     Link,
     Copy,
+}
+
+/// Attempt `FICLONE`. `Ok(None)` means the filesystem declined and the caller
+/// should copy; errors are only for genuinely unexpected failures.
+///
+/// Deliberately always attempted rather than predicted from the filesystem
+/// type: support is per (source, destination) pair -- EXDEV across mounts, and
+/// OpenZFS refuses cross-dataset clones on recordsize or encryption mismatch.
+#[cfg(target_os = "linux")]
+fn try_ficlone(src: &Path, dest: &Path) -> Result<Option<u64>> {
+    use std::os::fd::AsRawFd;
+    // _IOW(0x94, 9, int) -- linux/fs.h
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    let s = fs::File::open(src)?;
+    let d = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(dest)?;
+
+    let rc = unsafe { libc::ioctl(d.as_raw_fd(), FICLONE, s.as_raw_fd()) };
+    if rc == 0 {
+        let bytes = d.metadata()?.blocks() * 512;
+        return Ok(Some(bytes));
+    }
+    let e = io::Error::last_os_error();
+    drop(d);
+    let _ = fs::remove_file(dest);
+    match e.raw_os_error() {
+        // "this filesystem/pair cannot clone" -- every one of these means fall
+        // back, not fail.
+        Some(libc::EOPNOTSUPP)
+        | Some(libc::ENOTTY)
+        | Some(libc::EXDEV)
+        | Some(libc::EINVAL)
+        | Some(libc::EPERM)
+        | Some(libc::EACCES) => Ok(None),
+        _ => Err(Error::Io(e)),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_ficlone(_src: &Path, _dest: &Path) -> Result<Option<u64>> {
+    Ok(None)
+}
+
+/// How a writable copy was produced, and what it cost.
+///
+/// `#[non_exhaustive]` from the outset: a copy-on-write backend will add
+/// variants, and downstream `match`es must not break when it does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub enum Materialization {
+    /// The filesystem shared the blocks (FICLONE): btrfs, XFS with reflink, or
+    /// OpenZFS 2.2+ with `feature@block_cloning` and `zfs_bclone_enabled=1`.
+    Cloned { bytes_written: u64 },
+    /// Copied, skipping holes. `bytes_written` counts only real data, so a
+    /// regression to a densifying copy is visible rather than silent.
+    SparseCopy { bytes_written: u64 },
+}
+
+impl Materialization {
+    pub fn bytes_written(self) -> u64 {
+        match self {
+            Materialization::Cloned { bytes_written }
+            | Materialization::SparseCopy { bytes_written } => bytes_written,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -47,6 +201,22 @@ pub struct Store {
 
 /// Guard holding an exclusive flock for one key.
 pub struct KeyLock(fs::File);
+
+impl KeyLock {
+    /// Take an exclusive lock named `key` inside `dir`, creating `dir` if
+    /// needed. Shared by every backend -- only the storage differs, not the
+    /// mutual exclusion.
+    pub fn acquire(dir: &Path, key: &str) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{key}.lock")))?;
+        FileExt::lock_exclusive(&f)?;
+        Ok(KeyLock(f))
+    }
+}
 
 impl Drop for KeyLock {
     fn drop(&mut self) {
@@ -101,14 +271,7 @@ impl Store {
     /// that happen to produce the same rootfs will contend here, which is
     /// correct -- they want the same blob.
     pub fn lock(&self, key: &str) -> Result<KeyLock> {
-        let p = self.root.join("locks").join(format!("{key}.lock"));
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(p)?;
-        FileExt::lock_exclusive(&f)?;
-        Ok(KeyLock(f))
+        KeyLock::acquire(&self.root.join("locks"), key)
     }
 
     /// The stored image for `key`, if present. Touches `last_used`.
@@ -146,7 +309,7 @@ impl Store {
         match fs::rename(src, &dest) {
             Ok(()) => {}
             Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
-                fs::copy(src, &dest)?;
+                sparse_copy(src, &dest)?;
                 let _ = fs::remove_file(src);
             }
             Err(e) => return Err(Error::Io(e)),
@@ -157,6 +320,11 @@ impl Store {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o444);
         fs::set_permissions(&dest, perms)?;
 
+        // Durability before measurement: `blocks()` can read 0 while the data
+        // is still only in the page cache (ext4 delalloc, or a ZFS txg not yet
+        // synced). A zero `actual_bytes` would make GC believe the entry
+        // occupies nothing and never count it against a size budget.
+        fs::File::open(&dest).and_then(|f| f.sync_all()).ok();
         let md = fs::metadata(&dest)?;
         let now = now_secs();
         self.write_meta(&Entry {
@@ -215,12 +383,10 @@ impl Store {
                 if e.raw_os_error() == Some(libc::EXDEV)
                     || e.kind() == io::ErrorKind::PermissionDenied =>
             {
-                fs::copy(&blob, &part)?;
-                // A copy is a private file; make it writable like heyvm's
-                // existing catalog entries so nothing downstream is surprised.
-                let mut p = fs::metadata(&part)?.permissions();
-                std::os::unix::fs::PermissionsExt::set_mode(&mut p, 0o644);
-                fs::set_permissions(&part, p)?;
+                // A copy is a private file, and `sparse_copy` creates it 0644
+                // -- writable like heyvm's existing catalog entries, so
+                // nothing downstream is surprised by the blob's 0444.
+                sparse_copy(&blob, &part)?;
                 InstallKind::Copy
             }
             Err(e) => return Err(Error::Io(e)),
@@ -230,6 +396,59 @@ impl Store {
         // as links to one inode, the rename above is a silent no-op.
         let _ = fs::remove_file(&part);
         Ok(kind)
+    }
+
+    /// Produce a **writable private** copy of a stored image at `dest`.
+    ///
+    /// Distinct from [`Store::install`], which hardlinks: a hardlink is right
+    /// for read-only catalog names but hands out an alias of the shared 0444
+    /// blob, so writing through it would corrupt every other name at once.
+    /// This always yields an independent, writable file.
+    ///
+    /// Tries `FICLONE` first, so on a copy-on-write filesystem the copy is
+    /// near-free; otherwise falls back to a hole-preserving copy. Either way
+    /// the result reports the bytes actually written.
+    ///
+    /// Note this is a primitive, not a policy: it has no notion of leases or
+    /// of who owns the result. Reclaiming `dest` is the caller's business.
+    pub fn materialize(&self, key: &str, dest: &Path) -> Result<Materialization> {
+        let blob = self.blob(key);
+        if !blob.exists() {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no stored image for key {key}"),
+            )));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let _ = fs::remove_file(dest);
+
+        if let Some(bytes) = try_ficlone(&blob, dest)? {
+            return Ok(Materialization::Cloned {
+                bytes_written: bytes,
+            });
+        }
+        let bytes_written = sparse_copy(&blob, dest)?;
+        Ok(Materialization::SparseCopy { bytes_written })
+    }
+
+    /// Reclaim a copy previously produced by [`Store::materialize`].
+    ///
+    /// On a POSIX filesystem this is just an unlink -- the interesting case is
+    /// a backend where a materialization is a first-class object that pins the
+    /// blob it came from (a ZFS clone holds its origin snapshot). Without an
+    /// owner for that lifecycle, materializing leaks in two directions: the
+    /// clones themselves, and the blobs they make undeletable. Callers should
+    /// call this when a VM's disk is discarded.
+    ///
+    /// Idempotent: releasing something already gone is not an error.
+    pub fn release(&self, dest: &Path) -> Result<()> {
+        match fs::remove_file(dest) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(Error::Io(e)),
+        }
     }
 
     pub fn list(&self) -> Result<Vec<Entry>> {
@@ -256,14 +475,26 @@ impl Store {
         // Oldest first.
         entries.sort_by_key(|e| e.last_used);
 
-        let mut total: u64 = entries.iter().map(|e| e.actual_bytes).sum();
+        // Measure now rather than trusting `Entry.actual_bytes`, which was
+        // recorded at `put` time. On a filesystem that shares blocks, an
+        // entry's real footprint changes underneath us.
+        let live = |e: &Entry| -> u64 {
+            fs::metadata(self.blob(&e.key))
+                .map(|m| m.blocks() * 512)
+                .unwrap_or(e.actual_bytes)
+        };
+
+        let mut total: u64 = entries.iter().map(&live).sum();
         let now = now_secs();
         let mut report = GcReport {
             removed: Vec::new(),
             kept_linked: 0,
+            kept_busy: Vec::new(),
             freed_bytes: 0,
             total_before: total,
             dry_run: policy.dry_run,
+            stopped_early: None,
+            last_free: None,
         };
 
         for e in entries {
@@ -281,15 +512,124 @@ impl Store {
                 report.kept_linked += 1;
                 continue; // still installed somewhere
             }
+            let claimed = live(&e);
+
             if !policy.dry_run {
-                let _ = fs::remove_file(&blob);
+                // Two-phase delete. Removing the metadata first (or blindly)
+                // is how a blob becomes invisible garbage: it would vanish
+                // from `list()` while still occupying the disk, so no future
+                // GC could ever find it. A backend that refuses the removal --
+                // ZFS returns EBUSY for a dataset with dependent clones -- must
+                // therefore keep its metadata.
+                match fs::remove_file(&blob) {
+                    Ok(()) => {}
+                    Err(e2) if e2.kind() == io::ErrorKind::NotFound => {}
+                    Err(_) => {
+                        report.kept_busy.push(e.key);
+                        continue;
+                    }
+                }
                 let _ = fs::remove_file(self.meta(&e.key));
+
+                // Did the disk actually get smaller? Under block sharing the
+                // answer can be "no", and then evicting harder does not help:
+                // without this the size budget would evict the entire store
+                // and still be over. Only meaningful for a size policy.
+                if policy.max_bytes.is_some()
+                    && claimed > 0
+                    && let Some(freed) = self.freed_since(&mut report)
+                    && freed * 4 < claimed
+                {
+                    report.stopped_early = Some(
+                        "measured free space barely moved -- these blobs appear to \
+                         share blocks with something else; stopping rather than \
+                         evicting the whole store"
+                            .into(),
+                    );
+                    report.removed.push(e.key);
+                    report.freed_bytes += claimed;
+                    break;
+                }
             }
-            total = total.saturating_sub(e.actual_bytes);
-            report.freed_bytes += e.actual_bytes;
+            total = total.saturating_sub(claimed);
+            report.freed_bytes += claimed;
             report.removed.push(e.key);
         }
         Ok(report)
+    }
+
+    /// Bytes the filesystem reports as freed since the last call. `None` when
+    /// `statvfs` is unavailable, in which case the caller simply does not apply
+    /// the no-progress rule.
+    fn freed_since(&self, report: &mut GcReport) -> Option<u64> {
+        let now = free_bytes(&self.root)?;
+        let prev = report.last_free.replace(now);
+        prev.map(|p| now.saturating_sub(p))
+    }
+}
+
+/// The operations a storage backend must provide.
+///
+/// `Store` (POSIX files, hardlinks, `FICLONE`) is the default and only
+/// implementation compiled in unless the `zfs` feature is enabled. Every method
+/// mirrors an existing inherent method on `Store`, and the impl delegates to
+/// them -- inherent methods win Rust's method resolution, so existing callers
+/// are entirely unaffected by this trait existing.
+///
+/// Object-safe on purpose: the CLI picks a backend at runtime.
+pub trait StorageBackend: Send + Sync {
+    /// Where this backend keeps its data.
+    fn root(&self) -> &Path;
+    /// Serialize concurrent work on one key.
+    fn lock(&self, key: &str) -> Result<KeyLock>;
+    /// A path on the backend's own storage to build into, so `put` is cheap.
+    fn staging_path(&self, key: &str) -> PathBuf;
+    fn put(&self, key: &str, src: &Path, diff_ids: &[String]) -> Result<PathBuf>;
+    fn get(&self, key: &str) -> Option<PathBuf>;
+    fn entry(&self, key: &str) -> Result<Entry>;
+    /// Publish a *read-only shared* name for a stored image.
+    fn install(&self, key: &str, dest: &Path) -> Result<InstallKind>;
+    /// Produce a *writable private* copy.
+    fn materialize(&self, key: &str, dest: &Path) -> Result<Materialization>;
+    /// Reclaim something `materialize` produced. Idempotent.
+    fn release(&self, dest: &Path) -> Result<()>;
+    fn list(&self) -> Result<Vec<Entry>>;
+    fn gc(&self, policy: &GcPolicy) -> Result<GcReport>;
+}
+
+impl StorageBackend for Store {
+    fn root(&self) -> &Path {
+        Store::root(self)
+    }
+    fn lock(&self, key: &str) -> Result<KeyLock> {
+        Store::lock(self, key)
+    }
+    fn staging_path(&self, key: &str) -> PathBuf {
+        Store::staging_path(self, key)
+    }
+    fn put(&self, key: &str, src: &Path, diff_ids: &[String]) -> Result<PathBuf> {
+        Store::put(self, key, src, diff_ids)
+    }
+    fn get(&self, key: &str) -> Option<PathBuf> {
+        Store::get(self, key)
+    }
+    fn entry(&self, key: &str) -> Result<Entry> {
+        Store::entry(self, key)
+    }
+    fn install(&self, key: &str, dest: &Path) -> Result<InstallKind> {
+        Store::install(self, key, dest)
+    }
+    fn materialize(&self, key: &str, dest: &Path) -> Result<Materialization> {
+        Store::materialize(self, key, dest)
+    }
+    fn release(&self, dest: &Path) -> Result<()> {
+        Store::release(self, dest)
+    }
+    fn list(&self) -> Result<Vec<Entry>> {
+        Store::list(self)
+    }
+    fn gc(&self, policy: &GcPolicy) -> Result<GcReport> {
+        Store::gc(self, policy)
     }
 }
 
@@ -300,13 +640,41 @@ pub struct GcPolicy {
     pub dry_run: bool,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct GcReport {
     pub removed: Vec<String>,
+    /// Entries skipped because something still links them.
     pub kept_linked: usize,
+    /// Entries whose blob could not be removed -- e.g. a ZFS dataset with
+    /// dependent clones (EBUSY). Their metadata is deliberately preserved so
+    /// they stay visible to a later GC.
+    pub kept_busy: Vec<String>,
     pub freed_bytes: u64,
     pub total_before: u64,
     pub dry_run: bool,
+    /// Set when GC stopped because evicting was not actually freeing space.
+    pub stopped_early: Option<String>,
+    /// Crate-internal bookkeeping for the no-progress rule; not public API.
+    #[serde(skip)]
+    pub(crate) last_free: Option<u64>,
+}
+
+/// Free bytes on the filesystem holding `path`, via `statvfs`.
+#[cfg(target_os = "linux")]
+fn free_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn free_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 #[cfg(test)]
@@ -323,6 +691,67 @@ mod tests {
         let staging = s.staging_path(key);
         fs::write(&staging, bytes).unwrap();
         s.put(key, &staging, &["sha256:x".into()]).unwrap()
+    }
+
+    /// A sparse file must survive the copy as a sparse file.
+    ///
+    /// This is the regression test for `copy_file_range`, which `std::fs::copy`
+    /// uses and which silently densifies: rootfs images are extremely sparse
+    /// (one catalog image is 20 GiB apparent for 582 MiB of data), so a
+    /// densifying copy turns 582 MiB into 20 GiB of writes.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn sparse_copy_preserves_holes_and_reports_real_bytes() {
+        use std::io::{Seek, SeekFrom, Write};
+        const APPARENT: u64 = 64 * 1024 * 1024;
+        const CHUNK: usize = 1024 * 1024;
+
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("sparse.img");
+        {
+            // 4 MiB of real data, in four chunks scattered through 64 MiB.
+            let mut f = fs::File::create(&src).unwrap();
+            f.set_len(APPARENT).unwrap();
+            for i in 0..4u64 {
+                f.seek(SeekFrom::Start(i * 15 * 1024 * 1024)).unwrap();
+                f.write_all(&vec![b'D'; CHUNK]).unwrap();
+            }
+            f.sync_all().unwrap();
+        }
+        let src_md = fs::metadata(&src).unwrap();
+        let src_actual = src_md.blocks() * 512;
+        assert!(
+            src_actual < APPARENT / 4,
+            "fixture is not sparse: {src_actual} of {APPARENT}"
+        );
+
+        let dst = d.path().join("copy.img");
+        let written = sparse_copy(&src, &dst).unwrap();
+        let dst_md = fs::metadata(&dst).unwrap();
+
+        // The trailing hole must survive: a data-extent-only copy would
+        // truncate the file at the last byte of data.
+        assert_eq!(dst_md.len(), APPARENT, "apparent size changed");
+        // The point of the exercise.
+        assert!(
+            dst_md.blocks() * 512 <= src_actual + 2 * CHUNK as u64,
+            "copy densified: src actual {src_actual}, dst actual {}",
+            dst_md.blocks() * 512
+        );
+        assert!(
+            written < APPARENT / 4,
+            "wrote {written} bytes for {src_actual} bytes of data -- densified"
+        );
+        assert_eq!(
+            fs::read(&src).unwrap(),
+            fs::read(&dst).unwrap(),
+            "contents differ"
+        );
+        // Private and writable, never the blob's 0444.
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&dst_md.permissions()) & 0o777,
+            0o644
+        );
     }
 
     #[test]
@@ -401,6 +830,118 @@ mod tests {
     }
 
     #[test]
+    fn materialize_yields_an_independent_writable_file() {
+        let (d, s) = store();
+        put_dummy(&s, "k", b"payload");
+        let dest = d.path().join("vm/rootfs.ext4");
+        let m = s.materialize("k", &dest).unwrap();
+
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+
+        // Never a hardlink: that would hand out an alias of the shared 0444
+        // blob, and writing through it would corrupt every other name at once.
+        let blob = fs::metadata(s.blob("k")).unwrap();
+        let out = fs::metadata(&dest).unwrap();
+        assert_ne!(out.ino(), blob.ino(), "materialize returned a hardlink");
+        assert_eq!(blob.nlink(), 1, "materialize altered the blob's link count");
+
+        // Writable, unlike the blob.
+        assert_eq!(
+            std::os::unix::fs::PermissionsExt::mode(&out.permissions()) & 0o777,
+            0o644
+        );
+        assert!(fs::OpenOptions::new().write(true).open(&dest).is_ok());
+
+        // Whatever the filesystem did, the cost is reported.
+        assert!(m.bytes_written() <= 4096, "unexpected cost: {m:?}");
+    }
+
+    #[test]
+    fn materialize_is_repeatable_and_missing_key_errors() {
+        let (d, s) = store();
+        put_dummy(&s, "k", b"payload");
+        let dest = d.path().join("vm/rootfs.ext4");
+        s.materialize("k", &dest).unwrap();
+        s.materialize("k", &dest).unwrap(); // overwrites cleanly
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        assert!(s.materialize("nope", &d.path().join("x.ext4")).is_err());
+    }
+
+    /// The whole point: materializing a sparse image must not densify it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn materialize_does_not_densify() {
+        use std::io::{Seek, SeekFrom, Write};
+        const APPARENT: u64 = 64 * 1024 * 1024;
+
+        let (d, s) = store();
+        let staging = s.staging_path("sp");
+        {
+            let mut f = fs::File::create(&staging).unwrap();
+            f.set_len(APPARENT).unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&vec![b'D'; 2 * 1024 * 1024]).unwrap();
+            f.sync_all().unwrap();
+        }
+        s.put("sp", &staging, &["sha256:x".into()]).unwrap();
+
+        let dest = d.path().join("vm/rootfs.ext4");
+        let m = s.materialize("sp", &dest).unwrap();
+        let out = fs::metadata(&dest).unwrap();
+
+        assert_eq!(out.len(), APPARENT, "trailing hole lost");
+        assert!(
+            m.bytes_written() < APPARENT / 4,
+            "densified: wrote {} of {APPARENT} apparent ({m:?})",
+            m.bytes_written()
+        );
+        assert!(
+            out.blocks() * 512 < APPARENT / 4,
+            "densified on disk: {} bytes allocated",
+            out.blocks() * 512
+        );
+    }
+
+    #[test]
+    fn release_reclaims_a_materialization_and_is_idempotent() {
+        let (d, s) = store();
+        put_dummy(&s, "k", b"payload");
+        let dest = d.path().join("vm/rootfs.ext4");
+        s.materialize("k", &dest).unwrap();
+        assert!(dest.exists());
+
+        s.release(&dest).unwrap();
+        assert!(!dest.exists());
+        // Releasing twice must not be an error: a caller reaping on shutdown
+        // cannot know whether a crash already did it.
+        s.release(&dest).unwrap();
+        // The blob itself is untouched.
+        assert!(s.get("k").is_some());
+    }
+
+    /// The trait must not change what `Store` does -- it only adds a seam.
+    #[test]
+    fn trait_impl_matches_inherent_behaviour() {
+        let (d, s) = store();
+        let be: &dyn StorageBackend = &s;
+
+        let staging = be.staging_path("k");
+        fs::write(&staging, b"payload").unwrap();
+        be.put("k", &staging, &["sha256:x".into()]).unwrap();
+
+        assert_eq!(be.get("k"), Store::get(&s, "k"));
+        assert_eq!(be.entry("k").unwrap().size_bytes, 7);
+        assert_eq!(be.root(), Store::root(&s));
+
+        let dest = d.path().join("vm.ext4");
+        be.materialize("k", &dest).unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"payload");
+        be.release(&dest).unwrap();
+        assert!(!dest.exists());
+        assert_eq!(be.list().unwrap().len(), 1);
+    }
+
+    #[test]
     fn gc_respects_size_cap_and_evicts_oldest_first() {
         let (_d, s) = store();
         put_dummy(&s, "old", &[0u8; 8192]);
@@ -433,6 +974,66 @@ mod tests {
         assert_eq!(r.kept_linked, 1);
         assert!(r.removed.is_empty());
         assert!(s.get("linked").is_some());
+    }
+
+    /// A blob that cannot be removed must keep its metadata.
+    ///
+    /// Removing the meta regardless -- which is what the original code did, by
+    /// discarding both `remove_file` results -- makes the blob vanish from
+    /// `list()` while still occupying disk, so no later GC can ever find it.
+    /// A read-only parent directory stands in here for the case that motivates
+    /// it: ZFS returns EBUSY when destroying a dataset with dependent clones.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn gc_keeps_metadata_when_the_blob_cannot_be_removed() {
+        let (_d, s) = store();
+        put_dummy(&s, "stuck", &[0u8; 8192]);
+
+        // Make blobs/ read-only so unlink fails, mimicking EBUSY.
+        let blobs = s.root().join("blobs");
+        let mut perm = fs::metadata(&blobs).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o555);
+        fs::set_permissions(&blobs, perm).unwrap();
+
+        let r = s.gc(&GcPolicy {
+            max_bytes: Some(0),
+            ..Default::default()
+        });
+
+        // Restore before asserting, so a failure does not poison the tempdir.
+        let mut perm = fs::metadata(&blobs).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        fs::set_permissions(&blobs, perm).unwrap();
+
+        let r = r.unwrap();
+        assert_eq!(r.kept_busy, vec!["stuck".to_string()], "report: {r:?}");
+        assert!(r.removed.is_empty());
+        assert!(
+            s.entry("stuck").is_ok(),
+            "metadata was deleted for a blob that still exists -- it is now invisible garbage"
+        );
+    }
+
+    #[test]
+    fn gc_measures_live_size_rather_than_trusting_recorded_bytes() {
+        let (_d, s) = store();
+        put_dummy(&s, "k", &[0u8; 8192]);
+        // Corrupt the recorded size; GC should stat the blob instead.
+        let mut e = s.entry("k").unwrap();
+        e.actual_bytes = 999_999_999;
+        s.write_meta(&e).unwrap();
+
+        let r = s
+            .gc(&GcPolicy {
+                keep_secs: Some(0),
+                dry_run: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            r.total_before < 1_000_000,
+            "GC trusted the stale recorded size: {r:?}"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crate::buildkit::{self, BuildSpec, ContextSource, DockerfileSource, Prepared
 use crate::error::{Error, Result};
 use crate::ext4::{Ext4Options, Ext4Stats, SizePolicy, write_ext4_from_tar};
 use crate::key::RecipeKey;
-use crate::store::{InstallKind, Store};
+use crate::store::{InstallKind, StorageBackend};
 use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
@@ -93,7 +93,7 @@ fn decode(bytes: &[u8]) -> Box<dyn std::io::Read + '_> {
     }
 }
 
-pub fn build(req: &BuildRequest, store: &Store) -> Result<BuildOutcome> {
+pub fn build(req: &BuildRequest, store: &dyn StorageBackend) -> Result<BuildOutcome> {
     let t_all = Instant::now();
     let mut timings = Timings::default();
 
@@ -163,7 +163,7 @@ pub fn build(req: &BuildRequest, store: &Store) -> Result<BuildOutcome> {
 fn build_uncached(
     prepared: &Prepared,
     req: &BuildRequest,
-    store: &Store,
+    store: &dyn StorageBackend,
     recipe: &RecipeKey,
     key: &str,
     timings: &mut Timings,

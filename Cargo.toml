@@ -1,6 +1,6 @@
 [package]
 name = "vmbuild"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Fast, content-addressed VM rootfs builder for Firecracker/KVM"
 license = "MIT OR Apache-2.0"
@@ -9,9 +9,15 @@ readme = "README.md"
 rust-version = "1.85"
 keywords = ["ext4", "firecracker", "microvm", "rootfs", "buildkit"]
 categories = ["development-tools::build-utils", "filesystem", "virtualization"]
-# TODO(you): set before publishing -- I don't know the URL, and a wrong one is
-# worse than none. `documentation` defaults to docs.rs and needs no entry.
-# repository = "https://github.com/<org>/vmbuild"
+# `documentation` defaults to docs.rs and needs no entry.
+repository = "https://github.com/Heyo-Computer/vmbuild"
+
+[features]
+default = []
+# ZFS-backed storage: a dataset per image, a clone per materialization.
+# Experimental and root-only -- Linux cannot delegate the `mount` permission
+# that zfs create/clone/destroy all require. Off by default.
+zfs = []
 
 [dependencies]
 tar = "0.4"
