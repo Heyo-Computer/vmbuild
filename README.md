@@ -3,6 +3,17 @@
 Builds ext4 rootfs images for Firecracker/KVM microVMs from a Dockerfile —
 fast, content-addressed, and without root.
 
+```
+vmbuild build -f Dockerfile . -o rootfs.ext4                     # Dockerfile -> bootable ext4, cached
+vmbuild build -f deploy/image/Dockerfile . -n fastcar            # ...installed into heyvm's catalog
+vmbuild materialize <key> /run/vm-1/rootfs.ext4                  # private writable copy for one VM (reflink where possible)
+vmbuild --backend zfs --zfs-dataset tank/vmbuild --store /tank/vmbuild build -f Dockerfile .   # per-VM copies become zfs clones
+vmbuild ext4 --from-tar rootfs.tar -o out.ext4                   # any tar -> ext4, no Docker
+vmbuild verify out.ext4                                          # e2fsck -fn + feature set
+```
+
+Longer, runnable versions of each are in [`examples/`](examples/).
+
 BuildKit does the `RUN`/`COPY` work; vmbuild owns the part that was previously
 uncached: turning the built filesystem into an ext4 image, and remembering that
 it did.
@@ -124,4 +135,5 @@ are kept verbatim beside the code.
 
 ## Licence
 
-MIT OR Apache-2.0.
+MIT OR Apache-2.0, at your option — see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

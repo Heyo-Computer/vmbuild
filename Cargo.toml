@@ -1,6 +1,6 @@
 [package]
 name = "vmbuild"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Fast, content-addressed VM rootfs builder for Firecracker/KVM"
 license = "MIT OR Apache-2.0"
